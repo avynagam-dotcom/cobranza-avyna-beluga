@@ -45,12 +45,26 @@ function pad2(n) {
 function ymd(d) {
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
 }
+
+function getMexicoDate(date = new Date()) {
+  const options = { timeZone: "America/Mexico_City", year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' };
+  const formatter = new Intl.DateTimeFormat([], options);
+  const parts = formatter.formatToParts(date);
+  const get = (type) => parts.find(p => p.type === type).value;
+  
+  return new Date( get('year'), get('month') - 1, get('day'), get('hour'), get('minute'), get('second'));
+}
+
 function getCurrentBatchKey(now = new Date()) {
-  // martes más reciente a las 00:00
+  // Usar hora de México para determinar el día
+  const mxDate = getMexicoDate(now);
+  
+  // martes más reciente a las 00:00 (hora México)
   // JS: 0=Dom,1=Lun,2=Mar,3=Mié...
-  const day = now.getDay();
+  const day = mxDate.getDay();
   const daysSinceTuesday = (day - 2 + 7) % 7;
-  const d = new Date(now);
+  
+  const d = new Date(mxDate);
   d.setHours(0, 0, 0, 0);
   d.setDate(d.getDate() - daysSinceTuesday);
   return ymd(d);
