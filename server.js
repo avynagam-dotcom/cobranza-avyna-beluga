@@ -17,16 +17,31 @@ app.use(express.json({ limit: "2mb" }));
 // Default to Beluga's isolated path if env not set
 const DEFAULT_DATA_DIR = "/var/data/cobranza/beluga";
 const DATA_DIR = process.env.DATA_DIR || DEFAULT_DATA_DIR;
+
+// 1. Critical Startup Log
+console.log(`[System] Iniciando con DATA_DIR: ${DATA_DIR}`);
+
+// 2. Robust Directory Creation (First Thing)
+try {
+  if (!fs.existsSync(DATA_DIR)) {
+    console.log(`[System] Creando DATA_DIR: ${DATA_DIR}`);
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+} catch (e) {
+  console.error(`[System] CRITICAL: Fallo al crear DATA_DIR: ${e.message}`);
+}
+
 const DATA_SUBDIR = path.join(DATA_DIR, "data");
 const UPLOADS_SUBDIR = path.join(DATA_DIR, "uploads");
 
-console.log(`[System] DATA_DIR configured at: ${DATA_DIR}`);
+try {
+  if (!fs.existsSync(DATA_SUBDIR)) fs.mkdirSync(DATA_SUBDIR, { recursive: true });
+  if (!fs.existsSync(UPLOADS_SUBDIR)) fs.mkdirSync(UPLOADS_SUBDIR, { recursive: true });
+} catch (e) {
+  console.error(`[System] CRITICAL: Fallo al crear subdirectorios: ${e.message}`);
+}
 
-// Ensure folders exist immediately
-if (!fs.existsSync(DATA_SUBDIR)) fs.mkdirSync(DATA_SUBDIR, { recursive: true });
-if (!fs.existsSync(UPLOADS_SUBDIR)) fs.mkdirSync(UPLOADS_SUBDIR, { recursive: true });
-
-// ----- Migration Logic (Safe Transition)
+// ----- Migration Logic (Safe Transition & Silent)
 // Checks if new location is empty AND old location has data. If so, COPIES (does not move).
 try {
   const legacyDataDir = path.join(__dirname, "data");
@@ -35,28 +50,40 @@ try {
 
   // Only migrate if we see the new DB file is missing (fresh start in new location)
   // and we have a legacy DB file to copy.
-  const legacyDbExists = fs.existsSync(path.join(legacyDataDir, "notas.json"));
-  const newDbExists = fs.existsSync(dbFileNew);
+  let legacyDbExists = false;
+  let newDbExists = false;
+
+  try {
+    legacyDbExists = fs.existsSync(path.join(legacyDataDir, "notas.json"));
+    newDbExists = fs.existsSync(dbFileNew);
+  } catch (e) {
+    // Ignore stat errors during check
+  }
 
   if (legacyDbExists && !newDbExists) {
     console.log("[Migration] Legacy data detected and new location empty. Starting atomic migration...");
 
     // Copy/Migration helper
     const copyDir = (src, dest) => {
-      if (!fs.existsSync(src)) return;
-      const entries = fs.readdirSync(src, { withFileTypes: true });
-      let count = 0;
-      for (const entry of entries) {
-        if (entry.isFile() && !entry.name.startsWith(".")) {
-          try {
-            fs.copyFileSync(path.join(src, entry.name), path.join(dest, entry.name));
-            count++;
-          } catch (err) {
-            console.error(`[Migration] Failed to copy ${entry.name}:`, err.message);
+      try {
+        if (!fs.existsSync(src)) return 0;
+        const entries = fs.readdirSync(src, { withFileTypes: true });
+        let count = 0;
+        for (const entry of entries) {
+          if (entry.isFile() && !entry.name.startsWith(".")) {
+            try {
+              fs.copyFileSync(path.join(src, entry.name), path.join(dest, entry.name));
+              count++;
+            } catch (err) {
+              console.error(`[Migration] Failed to copy ${entry.name}:`, err.message);
+            }
           }
         }
+        return count;
+      } catch (e) {
+        console.error(`[Migration] Error reading source dir ${src}:`, e.message);
+        return 0;
       }
-      return count;
     };
 
     const dataCount = copyDir(legacyDataDir, DATA_SUBDIR);
@@ -69,7 +96,8 @@ try {
   }
 
 } catch (err) {
-  console.error("[Migration] CRITICAL ERROR during migration check:", err);
+  console.error("[Migration] CRITICAL ERROR during migration check (Ignored):", err);
+  // Silent fail: do not throw
 }
 
 const DB_FILE = path.join(DATA_SUBDIR, "notas.json");
