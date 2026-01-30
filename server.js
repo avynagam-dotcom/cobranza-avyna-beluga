@@ -7,34 +7,72 @@ const pdfParse = require("pdf-parse");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { saveData, logAudit } = require("./utils/persistence");
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-// ----- Paths
-// ----- Paths configuration (Render Persistent Disk Support)
-const ROOT = __dirname;
-const PUBLIC_DIR = path.join(ROOT, "public");
+// ----- Paths configuration (Strict Isolation)
+// Default to Beluga's isolated path if env not set
+const DEFAULT_DATA_DIR = "/var/data/cobranza/beluga";
+const DATA_DIR = process.env.DATA_DIR || DEFAULT_DATA_DIR;
+const DATA_SUBDIR = path.join(DATA_DIR, "data");
+const UPLOADS_SUBDIR = path.join(DATA_DIR, "uploads");
 
-// Detectar Persistent Disk de Render
-const RENDER_DISK_PATH = "/var/data/cobranza";
-// Usamos el disco solo si existe físicamente
-const USE_PERSISTENT = fs.existsSync(RENDER_DISK_PATH);
+console.log(`[System] DATA_DIR configured at: ${DATA_DIR}`);
 
-let DATA_DIR, UPLOADS_DIR;
+// Ensure folders exist immediately
+if (!fs.existsSync(DATA_SUBDIR)) fs.mkdirSync(DATA_SUBDIR, { recursive: true });
+if (!fs.existsSync(UPLOADS_SUBDIR)) fs.mkdirSync(UPLOADS_SUBDIR, { recursive: true });
 
-if (USE_PERSISTENT) {
-  console.log(`[System] Usando Persistent Disk en: ${RENDER_DISK_PATH}`);
-  DATA_DIR = path.join(RENDER_DISK_PATH, "data");
-  UPLOADS_DIR = path.join(RENDER_DISK_PATH, "uploads");
-} else {
-  console.log(`[System] Usando almacenamiento local (ephemeral/local)`);
-  DATA_DIR = process.env.DATA_DIR || path.join(ROOT, "data");
-  UPLOADS_DIR = path.join(ROOT, "uploads");
+// ----- Migration Logic (Safe Transition)
+// Checks if new location is empty AND old location has data. If so, COPIES (does not move).
+try {
+  const legacyDataDir = path.join(__dirname, "data");
+  const legacyUploadsDir = path.join(__dirname, "uploads");
+  const dbFileNew = path.join(DATA_SUBDIR, "notas.json");
+
+  // Only migrate if we see the new DB file is missing (fresh start in new location)
+  // and we have a legacy DB file to copy.
+  const legacyDbExists = fs.existsSync(path.join(legacyDataDir, "notas.json"));
+  const newDbExists = fs.existsSync(dbFileNew);
+
+  if (legacyDbExists && !newDbExists) {
+    console.log("[Migration] Legacy data detected and new location empty. Starting atomic migration...");
+
+    // Copy/Migration helper
+    const copyDir = (src, dest) => {
+      if (!fs.existsSync(src)) return;
+      const entries = fs.readdirSync(src, { withFileTypes: true });
+      let count = 0;
+      for (const entry of entries) {
+        if (entry.isFile() && !entry.name.startsWith(".")) {
+          try {
+            fs.copyFileSync(path.join(src, entry.name), path.join(dest, entry.name));
+            count++;
+          } catch (err) {
+            console.error(`[Migration] Failed to copy ${entry.name}:`, err.message);
+          }
+        }
+      }
+      return count;
+    };
+
+    const dataCount = copyDir(legacyDataDir, DATA_SUBDIR);
+    const uploadsCount = copyDir(legacyUploadsDir, UPLOADS_SUBDIR);
+
+    console.log(`[Migration] Complete. Migrated ${dataCount} data files and ${uploadsCount} uploads.`);
+    logAudit("MIGRATION", "system", { source: legacyDataDir, dest: DATA_DIR, success: true });
+  } else {
+    console.log("[Migration] No migration needed (Target exists or Source missing).");
+  }
+
+} catch (err) {
+  console.error("[Migration] CRITICAL ERROR during migration check:", err);
 }
 
-const DB_FILE = path.join(DATA_DIR, "notas.json");
+const DB_FILE = path.join(DATA_SUBDIR, "notas.json");
 
 // ----- Backup Automático cada 24h a R2
 const R2_ENABLED = process.env.R2_ENDPOINT && process.env.R2_ACCESS_KEY_ID && process.env.R2_SECRET_ACCESS_KEY && process.env.R2_BUCKET;
@@ -50,53 +88,7 @@ if (R2_ENABLED) {
   }, 24 * 60 * 60 * 1000);
 }
 
-// Ensure folders exist (Critical for new locations)
-for (const dir of [DATA_DIR, UPLOADS_DIR]) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-}
-
-// ----- Migration: Local -> Persistent (Idempotent)
-// Se ejecuta solo si estamos en Render (Persistent) y detectamos archivos locales que no están en el disco
-if (USE_PERSISTENT) {
-  try {
-    const localDataDir = path.join(ROOT, "data");
-    const localUploadsDir = path.join(ROOT, "uploads");
-
-    function migrateFiles(srcDir, destDir) {
-      if (!fs.existsSync(srcDir)) return;
-
-      const files = fs.readdirSync(srcDir);
-      let count = 0;
-
-      for (const file of files) {
-        if (file.startsWith(".")) continue; // Ignorar .DS_Store, etc
-
-        const srcPath = path.join(srcDir, file);
-        const destPath = path.join(destDir, file);
-
-        try {
-          // Solo copiamos si es archivo y NO existe en destino
-          if (fs.statSync(srcPath).isFile() && !fs.existsSync(destPath)) {
-            fs.copyFileSync(srcPath, destPath);
-            count++;
-          }
-        } catch (e) {
-          console.error(`[Migra] Error copiando ${file}:`, e.message);
-        }
-      }
-
-      if (count > 0) console.log(`[Migra] Se migraron ${count} archivos de ${srcDir} a ${destDir}`);
-    }
-
-    migrateFiles(localDataDir, DATA_DIR);
-    migrateFiles(localUploadsDir, UPLOADS_DIR);
-
-  } catch (err) {
-    console.error("[Migra] Fallo en proceso de migración:", err);
-  }
-}
-
-// ----- DB helpers
+// ----- DB helpers (Atomic)
 function loadDB() {
   try {
     const raw = fs.readFileSync(DB_FILE, "utf8");
@@ -107,7 +99,8 @@ function loadDB() {
   }
 }
 function saveDB(notas) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(notas, null, 2), "utf8");
+  // Use atomic persistence
+  saveData(DB_FILE, JSON.stringify(notas, null, 2));
 }
 
 // ----- Batch (miércoles 00:00)
@@ -360,7 +353,7 @@ app.post("/api/upload", upload.single("pdf"), async (req, res) => {
       ex.filename = filename;
 
       const filePath = path.join(UPLOADS_DIR, filename);
-      fs.writeFileSync(filePath, req.file.buffer);
+      saveData(filePath, req.file.buffer);
 
       notas[existingIdx] = ex;
       saveDB(notas);
@@ -376,7 +369,7 @@ app.post("/api/upload", upload.single("pdf"), async (req, res) => {
       "_"
     );
     const filePath = path.join(UPLOADS_DIR, safeName);
-    fs.writeFileSync(filePath, req.file.buffer);
+    saveData(filePath, req.file.buffer);
 
     const nota = {
       id,

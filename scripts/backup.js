@@ -6,14 +6,15 @@ const fs = require("fs");
 const path = require("path");
 
 async function runBackup() {
-    const SYSTEM_NAME = process.env.SYSTEM_NAME || "avyna-desconocido";
+    const SYSTEM_NAME = process.env.SYSTEM_NAME || "avyna-beluga";
     const R2_ENDPOINT = process.env.R2_ENDPOINT;
     const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
     const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
     const R2_BUCKET = process.env.R2_BUCKET;
 
-    // Carpeta de datos a respaldar (la del disco persistente)
-    const DATA_DIR = "/var/data/cobranza";
+    // Carpeta de datos a respaldar (la nueva ruta aislada)
+    const DATA_DIR = process.env.DATA_DIR || "/var/data/cobranza/beluga";
+
     // Si no existe el disco persistente, intentamos la local (desarrollo)
     const SOURCE_DIR = fs.existsSync(DATA_DIR) ? DATA_DIR : path.join(__dirname, "..");
 
@@ -52,7 +53,7 @@ async function runBackup() {
         const fileBuffer = fs.readFileSync(archivePath);
         await s3.send(new PutObjectCommand({
             Bucket: R2_BUCKET,
-            Key: `${SYSTEM_NAME}/${filename}`, // Organizado por carpeta de sistema
+            Key: `${SYSTEM_NAME}/${filename}`, // Organizado por carpeta de sistema (beluga/)
             Body: fileBuffer,
             ContentType: "application/gzip",
         }));
