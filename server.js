@@ -13,6 +13,10 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
+// ----- Paths
+const ROOT = __dirname;
+const PUBLIC_DIR = path.join(ROOT, "public");
+
 // ----- Paths configuration (Strict Isolation)
 // Default to Beluga's isolated path if env not set
 const DEFAULT_DATA_DIR = "/var/data/cobranza/beluga";
