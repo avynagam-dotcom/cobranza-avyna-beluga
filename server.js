@@ -96,7 +96,53 @@ try {
     console.log(`[Migration] Complete. Migrated ${dataCount} data files and ${uploadsCount} uploads.`);
     logAudit("MIGRATION", "system", { source: legacyDataDir, dest: DATA_DIR, success: true });
   } else {
-    console.log("[Migration] No migration needed (Target exists or Source missing).");
+    // 2. Check Legacy Persistent Disk (Previous Deployment Location: /var/data/cobranza/data)
+    const diskLegacyDataDir = "/var/data/cobranza/data";
+    const diskLegacyUploadsDir = "/var/data/cobranza/uploads";
+
+    // Only verify if we are indeed in a new isolated path (don't migrate recursively if paths are same)
+    const isDifferentPath = path.resolve(diskLegacyDataDir) !== path.resolve(DATA_SUBDIR);
+    let diskLegacyExists = false;
+    try { diskLegacyExists = fs.existsSync(path.join(diskLegacyDataDir, "notas.json")); } catch (e) { }
+
+    if (isDifferentPath && diskLegacyExists && !newDbExists) {
+      console.log(`[Migration] Found LEGACY PERSISTENT data at ${diskLegacyDataDir}. Migrating to isolated ${DATA_SUBDIR}...`);
+
+      // Helper specifically for this (re-using copyDir)
+      // Need to redefine or scope copyDir? It's inside the if block above.
+      // Let's copy-paste the logic or restructure.
+      // Restructuring for clarity/safety inside this try block.
+
+      const copyDirSafe = (src, dest) => {
+        try {
+          if (!fs.existsSync(src)) return 0;
+          const entries = fs.readdirSync(src, { withFileTypes: true });
+          let count = 0;
+          for (const entry of entries) {
+            // Avoid migrating the new folders if they are nested (which they shouldn't be, but safety first)
+            // entry.name: "beluga", "mars" -> skip these if we are copying from root
+            if (entry.isDirectory()) continue;
+
+            if (entry.isFile() && !entry.name.startsWith(".")) {
+              try {
+                fs.copyFileSync(path.join(src, entry.name), path.join(dest, entry.name));
+                count++;
+              } catch (err) {
+                console.error(`[Migration] Failed to copy ${entry.name}:`, err.message);
+              }
+            }
+          }
+          return count;
+        } catch (e) { return 0; }
+      };
+
+      const dCount = copyDirSafe(diskLegacyDataDir, DATA_SUBDIR);
+      const uCount = copyDirSafe(diskLegacyUploadsDir, UPLOADS_SUBDIR);
+      console.log(`[Migration] Persistent Disk Migration: ${dCount} data files, ${uCount} uploads.`);
+      logAudit("MIGRATION_DISK", "system", { source: diskLegacyDataDir, dest: DATA_DIR, success: true });
+    } else {
+      console.log("[Migration] No migration needed (Target exists or Source missing).");
+    }
   }
 
 } catch (err) {
