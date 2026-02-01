@@ -6,20 +6,23 @@ const fs = require("fs");
 const path = require("path");
 
 async function runBackup() {
-    const SYSTEM_NAME = process.env.SYSTEM_NAME || "avyna-beluga";
+    // Identidad del sistema: default a 'beluga' para asegurar la carpeta correcta en R2
+    const SYSTEM_NAME = process.env.SYSTEM_NAME || "beluga";
+
     const R2_ENDPOINT = process.env.R2_ENDPOINT;
     const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
     const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
     const R2_BUCKET = process.env.R2_BUCKET;
 
-    // Carpeta de datos a respaldar (la nueva ruta aislada)
+    // Carpeta de datos a respaldar (aislada)
     const DATA_DIR = process.env.DATA_DIR || "/var/data/cobranza/beluga";
 
-    // Si no existe el disco persistente, intentamos la local (desarrollo)
+    // Validación de fuente
     const SOURCE_DIR = fs.existsSync(DATA_DIR) ? DATA_DIR : path.join(__dirname, "..");
 
     if (!R2_ENDPOINT || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET) {
-        throw new Error("Faltan variables de entorno para el backup (R2)");
+        console.error("❌ [Backup] Faltan variables de entorno R2. Abortando.");
+        return; // No lanzamos error para no crashear proceso principal si se llama directo, pero logueamos
     }
 
     const date = new Date().toISOString().split("T")[0];
@@ -27,20 +30,23 @@ async function runBackup() {
     const archivePath = path.join("/tmp", filename);
 
     try {
-        console.log(`📦 Creando archivo comprimido: ${filename}...`);
+        console.log(`📦 [Backup] Iniciando respaldo para ${SYSTEM_NAME}...`);
+
         // Comprimimos data y uploads si existen en el SOURCE_DIR
         const targets = [];
         if (fs.existsSync(path.join(SOURCE_DIR, "data"))) targets.push("data");
         if (fs.existsSync(path.join(SOURCE_DIR, "uploads"))) targets.push("uploads");
 
         if (targets.length === 0) {
-            console.log("⚠️ No hay carpetas 'data' o 'uploads' para respaldar.");
+            console.log("⚠️ [Backup] No hay carpetas 'data' o 'uploads' en", SOURCE_DIR);
             return;
         }
 
-        execSync(`tar -czf ${archivePath} -C ${SOURCE_DIR} ${targets.join(" ")}`);
+        // Crear tarball
+        // Usamos cwd: SOURCE_DIR para que el tar contenga rutas relativas 'data/...'
+        execSync(`tar -czf ${archivePath} ${targets.join(" ")}`, { cwd: SOURCE_DIR });
 
-        console.log(`🚀 Subiendo a Cloudflare R2...`);
+        console.log(`🚀 [Backup] Subiendo ${filename} a R2...`);
         const s3 = new S3Client({
             region: "auto",
             endpoint: R2_ENDPOINT,
@@ -53,24 +59,28 @@ async function runBackup() {
         const fileBuffer = fs.readFileSync(archivePath);
         await s3.send(new PutObjectCommand({
             Bucket: R2_BUCKET,
-            Key: `${SYSTEM_NAME}/${filename}`, // Organizado por carpeta de sistema (beluga/)
+            Key: `${SYSTEM_NAME}/${filename}`, // Carpeta beluga/ en el bucket
             Body: fileBuffer,
             ContentType: "application/gzip",
         }));
 
-        console.log(`✅ Backup completado exitosamente: ${SYSTEM_NAME}/${filename}`);
-
-        // Limpieza
-        fs.unlinkSync(archivePath);
+        console.log(`✅ [Backup] Exitoso: ${SYSTEM_NAME}/${filename}`);
 
     } catch (error) {
-        console.error("❌ Error durante el backup:", error);
-        throw error;
+        console.error("❌ [Backup] Error crítico:", error.message);
+        throw error; // Re-throw para que el scheduler lo note
+    } finally {
+        if (fs.existsSync(archivePath)) {
+            fs.unlinkSync(archivePath);
+        }
     }
 }
 
 module.exports = runBackup;
 
 if (require.main === module) {
-    runBackup().catch(() => process.exit(1));
+    runBackup().catch((e) => {
+        console.error(e);
+        process.exit(1);
+    });
 }
