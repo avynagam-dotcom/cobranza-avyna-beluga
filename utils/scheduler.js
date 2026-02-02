@@ -20,7 +20,7 @@ function initScheduler() {
         timezone: "UTC"
     });
 
-    console.log("[Scheduler] ✅ Cron job de backup activo: 09:00 UTC diario.");
+    console.log("✅ Scheduler activo (Backup: 09:00 UTC).");
 }
 
 module.exports = { initScheduler };
