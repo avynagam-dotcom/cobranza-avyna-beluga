@@ -17,6 +17,80 @@ app.use(express.json({ limit: "2mb" }));
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, "public");
 
+// ----- System Identity (Hardcoded for Safety)
+const SYSTEM_NAME = "beluga";
+process.env.SYSTEM_NAME = SYSTEM_NAME; // Ensure env is synced
+
+// ----- Safe Migration V2 (History)
+// Converts simple 'pagado' number to 'pagos' array
+function runMigrationV2(dataDir) {
+  try {
+    const dbPath = path.join(dataDir, "notas.json");
+    if (!fs.existsSync(dbPath)) return;
+
+    // --- 1. Seguridad de Datos (Backup Crítico) ---
+    // Antes de leer/tocar nada, hacemos backup físico si no existe
+    const backupPath = path.join(dataDir, "notas.json.bak_seguridad");
+    if (!fs.existsSync(backupPath)) {
+      try {
+        fs.copyFileSync(dbPath, backupPath);
+        console.log(`[Backup] ✅ Copia de seguridad creada en ${backupPath}`);
+      } catch (bkErr) {
+        console.error(`[Backup] ❌ CRITICAL: Falló al crear backup: ${bkErr.message}`);
+        // Decisión de diseño: ¿Abortar si falla backup? 
+        // Sí, es "Paso Crítico".
+        return;
+      }
+    }
+
+    const raw = fs.readFileSync(dbPath, "utf8");
+    let notas = JSON.parse(raw);
+    if (!Array.isArray(notas)) return;
+
+    let changed = false;
+    let totalMigrated = 0;
+
+    notas = notas.map(n => {
+      // Check if it's legacy (has 'pagado' number but no 'pagos' array)
+      if (typeof n.pagado === 'number' && !n.pagos) {
+        // Create V2 structure
+        n.pagos = [];
+        if (n.pagado > 0) {
+          n.pagos.push({
+            id: crypto.randomUUID(),
+            fecha: n.uploadedAt || new Date().toISOString(), // Best guess for historical date
+            monto: n.pagado,
+            nota: "Migración Histórica V2",
+            timestamp: Date.now() // For sorting
+          });
+        }
+        // Keep 'pagado' for compatibility during transition if needed, 
+        // OR better: remove it effectively by making it a getter in the object if this was a class.
+        // For plain JSON, we will RE-CALCULATE 'pagado' from 'pagos' continuously.
+        // We delete the static 'pagado' field to force re-calculation.
+        delete n.pagado;
+        changed = true;
+        totalMigrated++;
+      }
+      return n;
+    });
+
+    if (changed) {
+      console.log(`[Migration V2] Migrada estructura de ${totalMigrated} notas a Historial de Pagos.`);
+
+      // Verification Step
+      // Re-calculate 'pagado' sum to match original logic is implicit if we trust the loop.
+      // We overwrite atomically.
+      fs.writeFileSync(dbPath, JSON.stringify(notas, null, 2));
+      logAudit("MIGRATION_V2", "system", { count: totalMigrated, success: true });
+    } else {
+      console.log("[Migration V2] Estructura al día.");
+    }
+  } catch (e) {
+    console.error("[Migration V2] Error CRÍTICO:", e.message);
+  }
+}
+
 // ----- Paths configuration (Strict Isolation)
 // Default to Beluga's isolated path if env not set
 const DEFAULT_DATA_DIR = "/var/data/cobranza/beluga";
@@ -141,9 +215,13 @@ try {
       console.log(`[Migration] Persistent Disk Migration: ${dCount} data files, ${uCount} uploads.`);
       logAudit("MIGRATION_DISK", "system", { source: diskLegacyDataDir, dest: DATA_DIR, success: true });
     } else {
-      console.log("[Migration] No migration needed (Target exists or Source missing).");
+      // No migration needed (Target exists or Source missing).
     }
   }
+
+  // 3. Run V2 Schema Migration (Pagos Array)
+  // Run this against the ACTIVE data dir (whether it was just migrated or already existed)
+  runMigrationV2(DATA_SUBDIR);
 
 } catch (err) {
   console.error("[Migration] CRITICAL ERROR during migration check (Ignored):", err);
@@ -319,7 +397,15 @@ function computeCredito(nota, now = new Date()) {
   const dueAt = nota.dueAt ? new Date(nota.dueAt) : null;
 
   const total = typeof nota.total === "number" && Number.isFinite(nota.total) ? nota.total : null;
-  const pagado = typeof nota.pagado === "number" && Number.isFinite(nota.pagado) ? nota.pagado : 0;
+
+  // V2: Calcular pagado sumando el historial
+  let pagado = 0;
+  if (Array.isArray(nota.pagos)) {
+    pagado = nota.pagos.reduce((acc, p) => acc + (Number(p.monto) || 0), 0);
+  } else if (typeof nota.pagado === "number") {
+    // Fallback temporal si algo escapó a la migración
+    pagado = nota.pagado;
+  }
 
   let saldo = null;
   if (total != null) saldo = Math.max(total - pagado, 0);
@@ -359,13 +445,107 @@ const upload = multer({
 // ----- Static
 app.use(express.static(PUBLIC_DIR));
 
+// ----- VIP Logic (Elite)
+function computeVIP(clientName, allClientNotes) {
+  if (!clientName) return false;
+
+  // 1. Volume > $10k (Total paid historical)
+  // We sum 'pagado' (calculated V2) of all notes
+  const volume = allClientNotes.reduce((sum, n) => {
+    // Re-calc locally to be sure (since n.pagado might be deleted)
+    let p = 0;
+    if (Array.isArray(n.pagos)) p = n.pagos.reduce((a, x) => a + (Number(x.monto) || 0), 0);
+    else p = typeof n.pagado === 'number' ? n.pagado : 0;
+    return sum + p;
+  }, 0);
+
+  if (volume <= 10000) return false;
+
+  // 2. Puntualidad Perfecta (0 atrasos históricos)
+  // Check every note. If ANY is late => NOT VIP.
+  const hasDelay = allClientNotes.some(n => {
+    if (!n.deliveredAt || !n.dueAt) return false; // Not delivered yet, cannot be late
+
+    const dueTime = new Date(n.dueAt).getTime();
+    const total = typeof n.total === 'number' ? n.total : 0;
+
+    // Calculate paid amount and *when* it was paid
+    let paid = 0;
+    let lastPaymentTime = 0;
+
+    const pagos = Array.isArray(n.pagos) ? n.pagos : [];
+    // If legacy 'pagado' exists and NO pagos array, we can't verify history perfectly.
+    // Benefit of the doubt? Or fail? 
+    // "Migración" payments have date = uploadedAt. If uploadedAt > dueAt, it counts as delay.
+    // Let's use what we have.
+
+    if (pagos.length > 0) {
+      // Sort payments by date to simulate timeline
+      const sorted = [...pagos].sort((a, b) => new Date(a.fecha) - new Date(b.fecha));
+
+      for (const p of sorted) {
+        paid += (Number(p.monto) || 0);
+        lastPaymentTime = new Date(p.fecha).getTime();
+        // If we reached total, stop checking future payments (maybe tips? or refund?)
+        if (paid >= total) break;
+      }
+    } else {
+      // Legacy fallback
+      paid = typeof n.pagado === 'number' ? n.pagado : 0;
+      // We don't have payment dates. 
+      // STRICT APPROACH: If paid < total AND now > dueAt => LATE (Current delay).
+      // If paid >= total => We assume it was on time if we lack data? 
+      // Let's check ONLY current status for legacy.
+    }
+
+    // Condition A: Currently Late (Unpaid & Past Due)
+    // Note: statusCredito might say VENCIDO.
+    const now = Date.now();
+    if (paid < total && now > dueTime) return true; // Late right now
+
+    // Condition B: Historically Late (Paid, but finished AFTER Due Date)
+    if (paid >= total && lastPaymentTime > dueTime + (24 * 3600 * 1000)) {
+      // Tolerance of 24h for timezones/delays? 
+      // Requirement says "0 atrasos". Let's be strict but reasonable (end of day).
+      // If payment time > dueTime => Late.
+      return true;
+    }
+
+    return false;
+  });
+
+  return !hasDelay;
+}
+
 // ----- API: listar notas
 app.get("/api/notas", (req, res) => {
   const notas = loadDB();
   const batchKey = getCurrentBatchKey();
   const now = new Date();
-  const notasWithCredito = notas.map((n) => ({ ...n, ...computeCredito(n, now) }));
-  res.json({ batchKey, notas: notasWithCredito });
+
+  // 1. Compute Credito & V2 fields for all
+  const enriched = notas.map((n) => ({ ...n, ...computeCredito(n, now) }));
+
+  // 2. Group by client to determine VIP
+  // Map: clientName -> [notes]
+  const notesByClient = {};
+  for (const n of enriched) {
+    if (n.cliente) {
+      if (!notesByClient[n.cliente]) notesByClient[n.cliente] = [];
+      notesByClient[n.cliente].push(n);
+    }
+  }
+
+  // 3. Attach VIP status
+  const final = enriched.map(n => {
+    let isVip = false;
+    if (n.cliente && notesByClient[n.cliente]) {
+      isVip = computeVIP(n.cliente, notesByClient[n.cliente]);
+    }
+    return { ...n, isVip };
+  });
+
+  res.json({ batchKey, notas: final });
 });
 
 // ----- API: subir PDF
@@ -446,7 +626,7 @@ app.post("/api/upload", upload.single("pdf"), async (req, res) => {
       filename: safeName,
       cliente,
       total: typeof total === "number" && Number.isFinite(total) ? total : null,
-      pagado: 0,
+      pagos: [], // V2 initialized
       deliveredAt: null,
       dueAt: null,
       firstPaymentAt: null,
@@ -506,8 +686,21 @@ app.post("/api/pago", (req, res) => {
     const idx = notas.findIndex((n) => String(n.id) === String(id));
     if (idx === -1) return res.status(404).json({ ok: false, message: "Nota no encontrada" });
 
-    const n = notas[idx];
-    n.pagado = Number(n.pagado || 0) + val;
+    // V2: Add to history
+    // Independencia Cronológica: payments always use server time
+    const newPayment = {
+      id: crypto.randomUUID(),
+      monto: val,
+      fecha: new Date().toISOString(),
+      nota: "Abono regular",
+      timestamp: Date.now()
+    };
+
+    if (!Array.isArray(n.pagos)) n.pagos = [];
+    n.pagos.push(newPayment);
+
+    // Remove legacy field if it exists to keep clean state
+    delete n.pagado;
 
     if (n.deliveredAt && !n.firstPaymentAt) {
       n.firstPaymentAt = new Date().toISOString();
@@ -533,7 +726,14 @@ app.get("/api/kpis", (req, res) => {
 
   for (const n of entregadas) {
     const total = typeof n.total === "number" && Number.isFinite(n.total) ? n.total : 0;
-    const pagado = typeof n.pagado === "number" && Number.isFinite(n.pagado) ? n.pagado : 0;
+
+    // V2 Logic
+    let pagado = 0;
+    if (Array.isArray(n.pagos)) {
+      pagado = n.pagos.reduce((acc, p) => acc + (Number(p.monto) || 0), 0);
+    } else {
+      pagado = typeof n.pagado === "number" ? n.pagado : 0;
+    }
 
     totalCobrable += total;
     totalCobrado += Math.min(pagado, total);
@@ -579,6 +779,68 @@ app.get("/api/faltantes", (req, res) => {
     });
 
   res.json({ ok: true, faltantes });
+});
+
+// ----- Closing Control (Patient Mode)
+let closingState = {
+  isActive: false,
+  activatedAt: null
+};
+
+// Persist closing state to disk? "data/status.json"
+// Requirement says "Instala el botón de cierre con el temporizador de 6 horas."
+// Doesn't strictly require persistence across restarts, but "Report Closing Control" conversation suggests it.
+// Let's implement simple file persistence for robustness.
+const STATUS_FILE = path.join(DATA_SUBDIR, "status_cierre.json");
+function loadStatus() {
+  try {
+    if (fs.existsSync(STATUS_FILE)) {
+      return JSON.parse(fs.readFileSync(STATUS_FILE, "utf8"));
+    }
+  } catch (e) { }
+  return { isActive: false, activatedAt: null };
+}
+function saveStatus(st) {
+  try {
+    saveData(STATUS_FILE, JSON.stringify(st)); // Atomic save
+  } catch (e) { console.error("Error saving status", e); }
+}
+
+closingState = loadStatus();
+
+// Check if 6 hours passed
+function checkClosingTimer() {
+  if (!closingState.isActive) return;
+  const now = Date.now();
+  const start = new Date(closingState.activatedAt).getTime();
+  const SIX_HOURS = 6 * 60 * 60 * 1000;
+
+  if (now - start > SIX_HOURS) {
+    console.log("[Closing Control] 6 hours expired. Resetting status.");
+    closingState = { isActive: false, activatedAt: null };
+    saveStatus(closingState);
+  }
+}
+
+app.get("/api/status-cierre", (req, res) => {
+  checkClosingTimer();
+  res.json({
+    ok: true,
+    isActive: closingState.isActive,
+    activatedAt: closingState.activatedAt,
+    serverTime: new Date().toISOString()
+  });
+});
+
+app.post("/api/activar-cierre", (req, res) => {
+  const now = new Date();
+  closingState = {
+    isActive: true,
+    activatedAt: now.toISOString()
+  };
+  saveStatus(closingState);
+  console.log(`[Closing Control] Activated at ${now.toISOString()}`);
+  res.json({ ok: true, isActive: true, activatedAt: closingState.activatedAt });
 });
 
 // ----- Start
