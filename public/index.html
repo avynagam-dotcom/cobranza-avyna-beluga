@@ -1061,9 +1061,7 @@
 
       // Bar
       const pctClamped = Math.min(Math.max(pct * 100, 0), 100);
-      document.querySelector("#kpiBar").style.background = `conic-gradient(var(--green) ${pctClamped}%, transparent 0)`; // Wait, original was a bar width
-      // Original: <div id="kpiBar" class="barGrad"></div> inside .bar -> div width
-      // Correcting:
+      // Removed conic-gradient override to let CSS linear-gradient shine
       kpiBar.style.width = pctClamped + "%";
     }
 
